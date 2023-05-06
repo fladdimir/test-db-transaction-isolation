@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.postgresql.util.PSQLException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -26,13 +27,17 @@ class OverlappingMeetingsConcurrentTransactionsTest {
 
     private TransactionTemplate txt;
 
+    @Autowired
+    JdbcTemplate jdbcTemplate;
+
     @BeforeEach
     void beforeEach() {
         repository.deleteAllInBatch();
         txt = new TransactionTemplate(tm);
     }
 
-    String resource = "r1";
+    String resource1 = "r1";
+    String resource2 = "r2";
     int start = 0;
     int end = 1;
 
@@ -41,13 +46,13 @@ class OverlappingMeetingsConcurrentTransactionsTest {
 
         Runnable doNothing = () -> {
         };
-        checkOverlapAndInsertInTx(resource, start, end, doNothing);
-        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource, start, end))
+        checkOverlapAndInsertInTx(resource1, start, end, doNothing);
+        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource1, start, end))
                 .isEqualTo(1);
 
         // no 2nd insert in subsequent transaction:
-        checkOverlapAndInsertInTx(resource, start, end, doNothing);
-        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource, start, end))
+        checkOverlapAndInsertInTx(resource1, start, end, doNothing);
+        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource1, start, end))
                 .isEqualTo(1);
     }
 
@@ -57,17 +62,17 @@ class OverlappingMeetingsConcurrentTransactionsTest {
         txt.setIsolationLevel(TransactionTemplate.ISOLATION_REPEATABLE_READ);
 
         var cyclicBarrier = new CyclicBarrier(2);
-        Runnable waitForConcurrentThread = waitForConcurrentThread(cyclicBarrier);
+        Runnable waitForConcurrentThread = await(cyclicBarrier);
 
-        var t1 = new Thread(() -> checkOverlapAndInsertInTx(resource, start, end, waitForConcurrentThread));
-        var t2 = new Thread(() -> checkOverlapAndInsertInTx(resource, start, end, waitForConcurrentThread));
+        var t1 = new Thread(() -> checkOverlapAndInsertInTx(resource1, start, end, waitForConcurrentThread));
+        var t2 = new Thread(() -> checkOverlapAndInsertInTx(resource1, start, end, waitForConcurrentThread));
 
         t1.start();
         t2.start();
         t1.join();
         t2.join();
 
-        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource, start, end))
+        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource1, start, end))
                 .isEqualTo(2); // two concurrent inserts, no conflict detected !
     }
 
@@ -77,10 +82,10 @@ class OverlappingMeetingsConcurrentTransactionsTest {
         txt.setIsolationLevel(TransactionTemplate.ISOLATION_SERIALIZABLE);
 
         var cyclicBarrier = new CyclicBarrier(2);
-        Runnable waitForConcurrentThread = waitForConcurrentThread(cyclicBarrier);
+        Runnable waitForConcurrentThread = await(cyclicBarrier);
 
-        var t1 = new Thread(() -> checkOverlapAndInsertInTx(resource, start, end, waitForConcurrentThread));
-        var t2 = new Thread(() -> checkOverlapAndInsertInTx(resource, start, end, waitForConcurrentThread));
+        var t1 = new Thread(() -> checkOverlapAndInsertInTx(resource1, start, end, waitForConcurrentThread));
+        var t2 = new Thread(() -> checkOverlapAndInsertInTx(resource1, start, end, waitForConcurrentThread));
 
         List<Throwable> exceptions = new LinkedList<>();
         t1.setUncaughtExceptionHandler((t, e) -> exceptions.add(e));
@@ -91,7 +96,7 @@ class OverlappingMeetingsConcurrentTransactionsTest {
         t1.join();
         t2.join();
         // conflict detected, just one insert
-        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource, start, end))
+        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource1, start, end))
                 .isEqualTo(1);
 
         // one insert failed:
@@ -101,7 +106,50 @@ class OverlappingMeetingsConcurrentTransactionsTest {
                         "ERROR: could not serialize access due to read/write dependencies among transactions");
     }
 
-    private Runnable waitForConcurrentThread(CyclicBarrier cyclicBarrier) {
+    @Test
+    void test_insertCheck_concurrentTransactions_serializable_differentResources() throws Exception {
+
+        // no conflict since inserts are different resources
+        // this may only work when executing the check-query via index, since a table
+        // scan will "read lock" the complete table
+        // https://stackoverflow.com/a/42303225
+
+        txt.setIsolationLevel(TransactionTemplate.ISOLATION_SERIALIZABLE);
+
+        var cyclicBarrier = new CyclicBarrier(2);
+        Runnable waitForConcurrentThread = await(cyclicBarrier);
+
+        var t1 = new Thread(() -> checkOverlapAndInsertInTx(resource1, start, end, waitForConcurrentThread));
+        var t2 = new Thread(() -> checkOverlapAndInsertInTx(resource2, start, end, waitForConcurrentThread));
+
+        List<Throwable> exceptions = new LinkedList<>();
+        t1.setUncaughtExceptionHandler((t, e) -> exceptions.add(e));
+        t2.setUncaughtExceptionHandler((t, e) -> exceptions.add(e));
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        if (!exceptions.isEmpty()) {
+            var e = new IllegalStateException();
+            exceptions.forEach(e::addSuppressed);
+            throw e;
+        }
+
+        // no conflicts (naively expected)
+        // -> depending on the lock used by the DB a false positive serialization
+        // exception might still be thrown on one of the commits
+        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource1, start, end))
+                .isEqualTo(1);
+
+        assertThat(repository.countByResourceAndEndTimeGreaterThanAndStartTimeLessThan(resource2, start, end))
+                .isEqualTo(1);
+
+        assertThat(exceptions).isEmpty();
+    }
+
+    private Runnable await(CyclicBarrier cyclicBarrier) {
         return () -> {
             try {
                 cyclicBarrier.await();
@@ -112,7 +160,9 @@ class OverlappingMeetingsConcurrentTransactionsTest {
     }
 
     void checkOverlapAndInsertInTx(String resource, int start, int end, Runnable actionBetweenCheckAndInsert) {
-        txt.executeWithoutResult(txs -> checkOverlapAndInsert(resource, start, end, actionBetweenCheckAndInsert));
+        txt.executeWithoutResult(txs -> {
+            checkOverlapAndInsert(resource, start, end, actionBetweenCheckAndInsert);
+        });
     }
 
     private void checkOverlapAndInsert(String resource, int start, int end, Runnable actionBetweenCheckAndInsert) {
